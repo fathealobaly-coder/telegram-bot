@@ -160,7 +160,7 @@ def buy_handler(message):
     )
 
     product_name = "Smart Profit Manager"
-    price_usd = 9.99
+    price_usd = 15.00
 
     logger.info(
         "Creating order %s for Telegram user %s",
