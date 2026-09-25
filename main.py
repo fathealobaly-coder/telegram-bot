@@ -1,43 +1,84 @@
 import os
-import json
-import hmac
-import hashlib
+import logging
 from contextlib import asynccontextmanager
-from typing import Any
 
-import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
+
+from supabase import create_client, Client
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
 # ENVIRONMENT VARIABLES
 # ============================================================
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+RAILWAY_URL = os.getenv("RAILWAY_URL")
 
-PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
 
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+# ============================================================
+# ENVIRONMENT VALIDATION
+# ============================================================
 
-NOWPAYMENTS_API_KEY = os.environ["NOWPAYMENTS_API_KEY"]
-NOWPAYMENTS_IPN_SECRET = os.environ.get(
-    "NOWPAYMENTS_IPN_SECRET",
-    "",
-)
+required_variables = {
+    "BOT_TOKEN": BOT_TOKEN,
+    "SUPABASE_URL": SUPABASE_URL,
+    "SUPABASE_SERVICE_ROLE_KEY": SUPABASE_SERVICE_ROLE_KEY,
+    "RAILWAY_URL": RAILWAY_URL,
+}
 
-# Bucket used for digital products
-SUPABASE_STORAGE_BUCKET = os.environ.get(
-    "SUPABASE_STORAGE_BUCKET",
-    "digital-products",
+missing_variables = [
+    name for name, value in required_variables.items()
+    if not value
+]
+
+if missing_variables:
+    raise RuntimeError(
+        "Missing required environment variables: "
+        + ", ".join(missing_variables)
+    )
+
+
+# ============================================================
+# NORMALIZE RAILWAY URL
+# ============================================================
+
+RAILWAY_URL = RAILWAY_URL.rstrip("/")
+
+WEBHOOK_PATH = "/telegram"
+
+WEBHOOK_URL = f"{RAILWAY_URL}{WEBHOOK_PATH}"
+
+
+# ============================================================
+# SUPABASE
+# ============================================================
+
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY,
 )
 
 
@@ -45,521 +86,616 @@ SUPABASE_STORAGE_BUCKET = os.environ.get(
 # TELEGRAM APPLICATION
 # ============================================================
 
-telegram_app = (
+application = (
     Application.builder()
     .token(BOT_TOKEN)
-    .updater(None)
     .build()
 )
 
 
 # ============================================================
-# SUPABASE
-# ============================================================
-
-def supabase_headers() -> dict[str, str]:
-    return {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
-async def supabase_get(
-    table: str,
-    params: dict[str, str] | None = None,
-) -> list[dict[str, Any]]:
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-
-    query_params = dict(params or {})
-
-    if not query_params.get("select"):
-        query_params["select"] = "*"
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                url,
-                headers=supabase_headers(),
-                params=query_params,
-            )
-
-        print(
-            f"SUPABASE GET "
-            f"table={table} "
-            f"status={response.status_code}"
-        )
-
-        if response.is_error:
-            print(
-                "SUPABASE ERROR RESPONSE:",
-                response.text
-            )
-            raise RuntimeError(
-                f"Supabase GET failed: "
-                f"HTTP {response.status_code}: "
-                f"{response.text}"
-            )
-
-        try:
-            data = response.json()
-        except Exception as exc:
-            print("SUPABASE JSON ERROR:", repr(exc))
-            print("SUPABASE RAW RESPONSE:", response.text)
-            raise
-
-        if not isinstance(data, list):
-            print("SUPABASE UNEXPECTED RESPONSE:", repr(data))
-            raise RuntimeError("Supabase response is not a JSON list.")
-
-        return data
-
-    except httpx.HTTPError as exc:
-        print("SUPABASE HTTPX ERROR:", repr(exc))
-        raise
-
-
-async def supabase_patch(
-    table: str,
-    params: dict[str, str],
-    data: dict[str, Any],
-) -> list[dict[str, Any]]:
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-
-    headers = supabase_headers()
-    headers["Prefer"] = "return=representation"
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.patch(
-                url,
-                headers=headers,
-                params=params,
-                json=data,
-            )
-
-        print(
-            f"SUPABASE PATCH "
-            f"table={table} "
-            f"status={response.status_code}"
-        )
-
-        if response.is_error:
-            print(
-                "SUPABASE PATCH ERROR:",
-                response.text
-            )
-            raise RuntimeError(
-                f"Supabase PATCH failed: "
-                f"HTTP {response.status_code}: "
-                f"{response.text}"
-            )
-
-        result = response.json()
-
-        if not isinstance(result, list):
-            return []
-
-        return result
-
-    except httpx.HTTPError as exc:
-        print("SUPABASE PATCH HTTPX ERROR:", repr(exc))
-        raise
-
-
-# ============================================================
-# TELEGRAM /start
+# /start
 # ============================================================
 
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+):
     if not update.effective_message:
         return
 
-    await update.effective_message.reply_text(
-        "مرحباً بك.\n\n"
-        "البوت يعمل بنجاح.\n\n"
-        "/products - عرض المنتجات\n"
-        "/status - حالة البوت"
+    user = update.effective_user
+
+    user_id = user.id if user else 0
+
+    username = user.username if user and user.username else ""
+
+    logger.info(
+        "START command from Telegram user_id=%s username=%s",
+        user_id,
+        username,
     )
 
+    # --------------------------------------------------------
+    # Marketing / referral link
+    # --------------------------------------------------------
 
-# ============================================================
-# TELEGRAM /status
-# ============================================================
+    try:
+        bot_info = await context.bot.get_me()
 
-async def status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not update.effective_message:
-        return
+        bot_username = bot_info.username
 
-    await update.effective_message.reply_text(
-        "البوت يعمل بنجاح عبر FastAPI و Telegram Webhook."
+        referral_link = (
+            f"https://t.me/{bot_username}?start=ref_{user_id}"
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Could not create referral link: %s",
+            exc,
+        )
+
+        referral_link = "رابط الإحالة غير متاح حالياً."
+
+    # --------------------------------------------------------
+    # Read referral parameter if Telegram supplied one
+    # --------------------------------------------------------
+
+    referral_parameter = None
+
+    if context.args:
+        referral_parameter = context.args[0]
+
+        logger.info(
+            "Referral parameter received: %s",
+            referral_parameter,
+        )
+
+    # --------------------------------------------------------
+    # Welcome message
+    # --------------------------------------------------------
+
+    text = (
+        "مرحباً بك في المتجر الرقمي 👋\n\n"
+        "يمكنك استخدام الأوامر التالية:\n\n"
+        "🛍 /products\n"
+        "لعرض المنتجات المتاحة حالياً.\n\n"
+        "💳 /buy\n"
+        "لبدء عملية الشراء واختيار المنتج.\n\n"
+        "🔗 رابط الإحالة التسويقية الخاص بك:\n"
+        f"{referral_link}\n\n"
+        "يمكنك مشاركة هذا الرابط مع الآخرين."
     )
 
+    if referral_parameter:
+        text += (
+            "\n\n"
+            f"تم استقبال رمز الإحالة: {referral_parameter}"
+        )
+
+    await update.effective_message.reply_text(text)
+
 
 # ============================================================
-# TELEGRAM /products
+# SUPABASE PRODUCTS READER
+# ============================================================
+
+def get_active_products():
+    """
+    قراءة المنتجات النشطة من جدول products في Supabase.
+    """
+
+    response = (
+        supabase
+        .table("products")
+        .select(
+            "id,sku,name,description,price_usd,pay_currency,delivery_type,active"
+        )
+        .eq("active", True)
+        .order("created_at", desc=False)
+        .execute()
+    )
+
+    return response.data or []
+
+
+# ============================================================
+# /products
 # ============================================================
 
 async def products_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+):
     if not update.effective_message:
         return
 
+    logger.info(
+        "PRODUCTS command from user_id=%s",
+        update.effective_user.id if update.effective_user else "unknown",
+    )
+
     try:
-        # المحاولة الأولى: مع فلتر active=true
-        try:
-            products = await supabase_get(
-                "products",
-                {
-                    "select": "*",
-                    "active": "eq.true",
-                    "order": "created_at.asc",
-                },
-            )
-        except Exception as first_error:
-            print("PRODUCTS FILTERED QUERY FAILED:", repr(first_error))
-            print("Retrying products query without active filter...")
-            
-            # المحاولة الثانية: استعلام مرن بدون فلتر active
-            products = await supabase_get(
-                "products",
-                {
-                    "select": "*",
-                },
-            )
-
-        if not products:
-            await update.effective_message.reply_text(
-                "لا توجد منتجات متاحة حالياً."
-            )
-            print("PRODUCTS: query succeeded but returned 0 rows.")
-            return
-
-        lines = ["المنتجات المتاحة:\n"]
-
-        for product in products:
-            name = (
-                product.get("name")
-                or product.get("title")
-                or product.get("product_name")
-                or "منتج بدون اسم"
-            )
-
-            price = (
-                product.get("price_usd")
-                or product.get("price")
-                or product.get("amount")
-                or "غير محدد"
-            )
-
-            currency = (
-                product.get("pay_currency")
-                or product.get("currency")
-                or "USD"
-            )
-
-            description = product.get("description") or ""
-
-            line = f"• {name}\nالسعر: {price} {currency}"
-            if description:
-                line += f"\n{description}"
-
-            lines.append(line)
-
-        await update.effective_message.reply_text("\n\n".join(lines))
-        print(f"PRODUCTS SUCCESS: {len(products)} product(s) returned.")
+        products = get_active_products()
 
     except Exception as exc:
-        print("PRODUCTS ERROR:", repr(exc))
+        logger.exception(
+            "PRODUCTS ERROR: %s",
+            exc,
+        )
+
         await update.effective_message.reply_text(
             "حدث خطأ أثناء قراءة المنتجات.\n"
-            "تم تسجيل تفاصيل الخطأ في Railway Logs."
+            "يرجى المحاولة مرة أخرى."
         )
 
-
-# ============================================================
-# REGISTER TELEGRAM HANDLERS
-# ============================================================
-
-telegram_app.add_handler(CommandHandler("start", start_command))
-telegram_app.add_handler(CommandHandler("products", products_command))
-telegram_app.add_handler(CommandHandler("status", status_command))
-
-
-# ============================================================
-# DIGITAL PRODUCT DELIVERY
-# ============================================================
-
-async def deliver_order(order: dict[str, Any]) -> None:
-    order_id = order.get("id")
-    telegram_user_id = order.get("telegram_user_id")
-    product_id = order.get("product_id")
-
-    if not telegram_user_id:
-        raise ValueError("Order has no telegram_user_id.")
-
-    if not product_id:
-        raise ValueError("Order has no product_id.")
-
-    products = await supabase_get(
-        "products",
-        {
-            "select": "*",
-            "id": f"eq.{product_id}",
-            "limit": "1",
-        },
-    )
+        return
 
     if not products:
-        raise ValueError(f"Product not found: {product_id}")
-
-    product = products[0]
-    storage_path = product.get("storage_path")
-
-    if not storage_path:
-        raise ValueError(f"Product {product_id} has no storage_path.")
-
-    storage_url = (
-        f"{SUPABASE_URL}/storage/v1/object/"
-        f"{SUPABASE_STORAGE_BUCKET}/"
-        f"{storage_path}"
-    )
-
-    print(f"Downloading product file: {storage_path}")
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        response = await client.get(
-            storage_url,
-            headers={
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            },
+        await update.effective_message.reply_text(
+            "لا توجد منتجات متاحة حالياً."
         )
 
-    if response.is_error:
-        print("STORAGE DOWNLOAD ERROR:", response.status_code, response.text)
-        raise RuntimeError(f"Storage download failed: HTTP {response.status_code}")
+        return
 
-    filename = storage_path.split("/")[-1]
+    lines = ["🛍 المنتجات المتاحة حالياً:\n"]
 
-    await telegram_app.bot.send_document(
-        chat_id=int(telegram_user_id),
-        document=response.content,
-        filename=filename,
-        caption=(
-            "تم تأكيد الدفع بنجاح.\n"
-            "إليك المنتج المطلوب."
-        ),
+    for product in products:
+        product_name = product.get("name") or "منتج بدون اسم"
+
+        sku = product.get("sku") or ""
+
+        description = product.get("description") or ""
+
+        price_usd = product.get("price_usd")
+
+        pay_currency = (
+            product.get("pay_currency")
+            or "usdttrc20"
+        )
+
+        lines.append(
+            f"📦 {product_name}"
+        )
+
+        if sku:
+            lines.append(
+                f"🔖 SKU: {sku}"
+            )
+
+        if description:
+            lines.append(
+                f"📝 {description}"
+            )
+
+        if price_usd is not None:
+            lines.append(
+                f"💵 السعر: {price_usd} USD"
+            )
+
+        lines.append(
+            f"💰 الدفع: {pay_currency}"
+        )
+
+        lines.append("")
+
+    lines.append(
+        "لشراء منتج استخدم الأمر:\n"
+        "/buy"
     )
 
-    print(f"DELIVERY SUCCESS: order={order_id}, telegram={telegram_user_id}, file={storage_path}")
+    await update.effective_message.reply_text(
+        "\n".join(lines)
+    )
 
 
 # ============================================================
-# NOWPAYMENTS SIGNATURE
+# /buy
 # ============================================================
 
-def verify_nowpayments_signature(
-    raw_body: bytes,
-    received_signature: str | None,
-) -> bool:
-    if not NOWPAYMENTS_IPN_SECRET:
-        print("WARNING: NOWPAYMENTS_IPN_SECRET is not configured.")
-        return False
+async def buy_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.effective_message:
+        return
 
-    if not received_signature:
-        print("NOWPAYMENTS: Missing x-nowpayments-sig header.")
-        return False
+    logger.info(
+        "BUY command from user_id=%s",
+        update.effective_user.id if update.effective_user else "unknown",
+    )
 
     try:
-        payload = json.loads(raw_body.decode("utf-8"))
+        products = get_active_products()
+
     except Exception as exc:
-        print("NOWPAYMENTS JSON ERROR:", repr(exc))
-        return False
+        logger.exception(
+            "BUY PRODUCTS ERROR: %s",
+            exc,
+        )
 
-    signed_payload = json.dumps(
-        payload,
-        separators=(",", ":"),
-        sort_keys=True,
+        await update.effective_message.reply_text(
+            "حدث خطأ أثناء تحميل المنتجات للشراء.\n"
+            "يرجى المحاولة مرة أخرى."
+        )
+
+        return
+
+    if not products:
+        await update.effective_message.reply_text(
+            "لا توجد منتجات متاحة للشراء حالياً."
+        )
+
+        return
+
+    keyboard = []
+
+    for product in products:
+        product_id = product.get("id")
+
+        product_name = (
+            product.get("name")
+            or product.get("sku")
+            or "منتج"
+        )
+
+        price_usd = product.get("price_usd")
+
+        if price_usd is not None:
+            button_text = (
+                f"{product_name} - ${price_usd}"
+            )
+        else:
+            button_text = product_name
+
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    button_text,
+                    callback_data=f"buy:{product_id}",
+                )
+            ]
+        )
+
+    keyboard_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.effective_message.reply_text(
+        "🛒 اختر المنتج الذي تريد شراءه:",
+        reply_markup=keyboard_markup,
     )
-
-    expected_signature = hmac.new(
-        NOWPAYMENTS_IPN_SECRET.encode("utf-8"),
-        signed_payload.encode("utf-8"),
-        hashlib.sha512,
-    ).hexdigest()
-
-    valid = hmac.compare_digest(expected_signature, received_signature)
-    if not valid:
-        print("NOWPAYMENTS: INVALID SIGNATURE")
-
-    return valid
 
 
 # ============================================================
-# NOWPAYMENTS IPN PROCESSOR
+# PRODUCT SELECTION
 # ============================================================
 
-async def process_nowpayments_ipn(payload: dict[str, Any]) -> None:
-    print("NOWPAYMENTS IPN RECEIVED:", json.dumps(payload, ensure_ascii=False))
+async def product_selected(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
 
-    status = str(payload.get("payment_status", "")).lower()
-    payment_id = payload.get("payment_id") or payload.get("id")
-
-    if not payment_id:
-        print("NOWPAYMENTS IPN ignored: payment_id missing.")
+    if not query:
         return
 
-    if status not in {"finished", "confirmed"}:
-        print(f"NOWPAYMENTS status={status}; no delivery.")
+    await query.answer()
+
+    data = query.data or ""
+
+    if not data.startswith("buy:"):
         return
 
-    orders = await supabase_get(
-        "orders",
-        {
-            "select": "*",
-            "invoice_id": f"eq.{payment_id}",
-            "limit": "1",
-        },
+    product_id = data.split(":", 1)[1]
+
+    logger.info(
+        "Product selected: product_id=%s user_id=%s",
+        product_id,
+        query.from_user.id,
     )
 
-    if not orders:
-        print(f"No order found for payment_id={payment_id}")
+    try:
+        response = (
+            supabase
+            .table("products")
+            .select(
+                "id,sku,name,description,price_usd,pay_currency,delivery_type,active"
+            )
+            .eq("id", product_id)
+            .eq("active", True)
+            .limit(1)
+            .execute()
+        )
+
+        products = response.data or []
+
+    except Exception as exc:
+        logger.exception(
+            "PRODUCT SELECTION ERROR: %s",
+            exc,
+        )
+
+        await query.edit_message_text(
+            "حدث خطأ أثناء قراءة المنتج."
+        )
+
         return
 
-    order = orders[0]
+    if not products:
+        await query.edit_message_text(
+            "هذا المنتج غير متاح حالياً."
+        )
 
-    if order.get("payment_status") == "CONFIRMED":
-        print(f"Order {order.get('id')} is already CONFIRMED.")
         return
 
-    updated = await supabase_patch(
-        "orders",
-        {"id": f"eq.{order['id']}"},
-        {"payment_status": "CONFIRMED"},
+    product = products[0]
+
+    product_name = product.get("name") or "منتج"
+
+    description = product.get("description") or ""
+
+    price_usd = product.get("price_usd")
+
+    pay_currency = (
+        product.get("pay_currency")
+        or "usdttrc20"
     )
 
-    if not updated:
-        raise RuntimeError("Failed to update order to CONFIRMED.")
+    text = (
+        "🛒 المنتج المختار:\n\n"
+        f"📦 {product_name}\n"
+    )
 
-    confirmed_order = updated[0]
-    await deliver_order(confirmed_order)
+    if description:
+        text += f"\n📝 {description}\n"
+
+    if price_usd is not None:
+        text += f"\n💵 السعر: {price_usd} USD\n"
+
+    text += (
+        f"💰 العملة: {pay_currency}\n\n"
+        "تم اختيار المنتج بنجاح.\n"
+        "خطوة إنشاء فاتورة الدفع يمكن ربطها هنا "
+        "بـ NOWPayments."
+    )
+
+    await query.edit_message_text(text)
 
 
 # ============================================================
-# FASTAPI LIFESPAN
+# REGISTER ALL TELEGRAM HANDLERS
+# ============================================================
+
+application.add_handler(
+    CommandHandler("start", start_command)
+)
+
+application.add_handler(
+    CommandHandler("products", products_command)
+)
+
+application.add_handler(
+    CommandHandler("buy", buy_command)
+)
+
+application.add_handler(
+    CallbackQueryHandler(
+        product_selected,
+        pattern=r"^buy:"
+    )
+)
+
+
+# ============================================================
+# FASTAPI LIFECYCLE
 # ============================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Starting Telegram application...")
-    await telegram_app.initialize()
-    await telegram_app.start()
+    """
+    FastAPI lifecycle.
 
-    webhook_url = f"{PUBLIC_BASE_URL}/webhook"
-    await telegram_app.bot.set_webhook(
-        url=webhook_url,
-        allowed_updates=Update.ALL_TYPES,
-    )
-    print(f"Telegram webhook configured: {webhook_url}")
+    startup:
+        initialize Telegram application
+        start Telegram application
+        configure Telegram webhook
 
-    yield
+    shutdown:
+        delete webhook
+        stop Telegram application
+        shutdown Telegram application
+    """
 
-    print("Stopping Telegram application...")
+    logger.info("Starting Telegram application...")
+
     try:
-        await telegram_app.bot.delete_webhook()
-    except Exception as exc:
-        print("Webhook delete warning:", repr(exc))
+        # ----------------------------------------------------
+        # Initialize Telegram Application
+        # ----------------------------------------------------
 
-    await telegram_app.stop()
-    await telegram_app.shutdown()
+        await application.initialize()
+
+        logger.info(
+            "Telegram application initialized."
+        )
+
+        # ----------------------------------------------------
+        # Start Telegram Application
+        # ----------------------------------------------------
+
+        await application.start()
+
+        logger.info(
+            "Telegram application started."
+        )
+
+        # ----------------------------------------------------
+        # Configure Webhook
+        # ----------------------------------------------------
+
+        await application.bot.set_webhook(
+            url=WEBHOOK_URL,
+            drop_pending_updates=False,
+        )
+
+        logger.info(
+            "Telegram webhook configured: %s",
+            WEBHOOK_URL,
+        )
+
+        logger.info(
+            "Bot is now running."
+        )
+
+        yield
+
+    except Exception as exc:
+        logger.exception(
+            "Telegram startup error: %s",
+            exc,
+        )
+
+        raise
+
+    finally:
+        # ----------------------------------------------------
+        # SHUTDOWN
+        # ----------------------------------------------------
+
+        logger.info(
+            "Shutting down Telegram application..."
+        )
+
+        try:
+            await application.bot.delete_webhook(
+                drop_pending_updates=False
+            )
+
+        except Exception as exc:
+            logger.warning(
+                "Could not delete webhook: %s",
+                exc,
+            )
+
+        try:
+            await application.stop()
+
+        except Exception as exc:
+            logger.warning(
+                "Could not stop Telegram application: %s",
+                exc,
+            )
+
+        try:
+            await application.shutdown()
+
+        except Exception as exc:
+            logger.warning(
+                "Could not shutdown Telegram application: %s",
+                exc,
+            )
+
+        logger.info(
+            "Telegram application stopped."
+        )
 
 
 # ============================================================
-# FASTAPI APP
+# FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
     title="Telegram Digital Store",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
 
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
 @app.get("/")
 async def root():
     return {
-        "status": "ok",
-        "service": "telegram-bot",
+        "status": "online",
+        "service": "telegram-digital-store",
+        "webhook": WEBHOOK_URL,
     }
 
 
-@app.get("/health")
-async def health():
+# ============================================================
+# STATUS
+# ============================================================
+
+@app.get("/status")
+async def status():
     return {
-        "status": "healthy",
-        "telegram_webhook": "/webhook",
-        "nowpayments_webhook": "/webhook/nowpayments",
+        "status": "running",
+        "telegram": "webhook",
+        "supabase": "configured",
+        "webhook_url": WEBHOOK_URL,
     }
 
 
-@app.post("/webhook")
+# ============================================================
+# TELEGRAM WEBHOOK
+# ============================================================
+
+@app.post("/telegram")
 async def telegram_webhook(request: Request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, bot=telegram_app.bot)
-        await telegram_app.update_queue.put(update)
-        return JSONResponse({"ok": True})
-    except Exception as exc:
-        print("TELEGRAM WEBHOOK ERROR:", repr(exc))
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid Telegram update",
-        )
-
-
-@app.post("/webhook/nowpayments")
-async def nowpayments_webhook(request: Request):
-    raw_body = await request.body()
-    signature = request.headers.get("x-nowpayments-sig")
-
-    if not verify_nowpayments_signature(raw_body, signature):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid NOWPayments signature",
-        )
+    """
+    Receives Telegram webhook updates and sends them
+    into the SAME python-telegram-bot Application.
+    """
 
     try:
-        payload = json.loads(raw_body.decode("utf-8"))
-        await process_nowpayments_ipn(payload)
-        return JSONResponse({"ok": True})
-    except HTTPException:
-        raise
+        update_data = await request.json()
+
+        telegram_update = Update.de_json(
+            update_data,
+            application.bot,
+        )
+
+        await application.process_update(
+            telegram_update
+        )
+
+        return {
+            "ok": True
+        }
+
     except Exception as exc:
-        print("NOWPAYMENTS WEBHOOK ERROR:", repr(exc))
-        raise HTTPException(
+        logger.exception(
+            "Telegram webhook processing error: %s",
+            exc,
+        )
+
+        return JSONResponse(
             status_code=500,
-            detail="Webhook processing failed",
+            content={
+                "ok": False,
+                "error": "Webhook processing failed",
+            },
         )
 
 
 # ============================================================
-# RAILWAY ENTRYPOINT
+# RAILWAY STARTUP
 # ============================================================
 
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(
+        os.getenv(
+            "PORT",
+            "8000"
+        )
+    )
+
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=port,
+        reload=False,
     )
