@@ -2,314 +2,140 @@ import os
 import sys
 import time
 import logging
-
+import threading
 import requests
 import telebot
-
+from fastapi import FastAPI, Request
+import uvicorn
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-
 logger = logging.getLogger(__name__)
 
-
+# قراءة المتغيرات السرية من Railway
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+CALLBACK_URL = os.getenv("NOWPAYMENTS_CALLBACK_URL")
 
 NOWPAYMENTS_URL = "https://api.nowpayments.io/v1/payment"
 
-CALLBACK_URL = os.getenv(
-    "NOWPAYMENTS_CALLBACK_URL",
-    "https://YOUR-RAILWAY-DOMAIN/webhook/nowpayments"
-)
-
-
 def validate_environment():
     missing = []
-
-    if not BOT_TOKEN:
-        missing.append("BOT_TOKEN")
-
-    if not NOWPAYMENTS_API_KEY:
-        missing.append("NOWPAYMENTS_API_KEY")
-
+    if not BOT_TOKEN: missing.append("BOT_TOKEN")
+    if not NOWPAYMENTS_API_KEY: missing.append("NOWPAYMENTS_API_KEY")
+    if not SUPABASE_URL: missing.append("SUPABASE_URL")
+    if not SUPABASE_KEY: missing.append("SUPABASE_SERVICE_ROLE_KEY")
     if missing:
-        logger.error(
-            "MISSING ENVIRONMENT VARIABLES: %s",
-            ", ".join(missing)
-        )
-        logger.error(
-            "Add these variables in Railway Service -> Variables."
-        )
+        logger.error("MISSING ENVIRONMENT VARIABLES: %s", ", ".join(missing))
         sys.exit(1)
-
-    logger.info("Environment variables verified successfully.")
-
 
 validate_environment()
 
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+app = FastAPI()
 
-bot = telebot.TeleBot(
-    BOT_TOKEN,
-    parse_mode=None
-)
-
-
-def create_nowpayments_payment(
-    price_usd,
-    order_id,
-    product_name
-):
+# دالة تسليم المنتج من Supabase
+def deliver_product(chat_id: str, file_path: str = "gaming_vault .zip"):
+    bucket = "digital-products"
+    logger.info("جاري تحميل الملف %s للمستخدم %s", file_path, chat_id)
+    
     headers = {
-        "x-api-key": NOWPAYMENTS_API_KEY,
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_KEY,
     }
-
-    payload = {
-        "price_amount": float(price_usd),
-        "price_currency": "usd",
-        "pay_currency": "usdttrc20",
-        "ipn_callback_url": CALLBACK_URL,
-        "order_id": str(order_id),
-        "order_description": product_name
-    }
-
-    logger.info(
-        "Creating NOWPayments payment for order %s",
-        order_id
+    
+    download_url = f"{SUPABASE_URL}/storage/v1/object/authenticated/{bucket}/{requests.utils.quote(file_path, safe='/')}"
+    res = requests.get(download_url, headers=headers, timeout=120)
+    
+    if res.status_code != 200:
+        alt_url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{requests.utils.quote(file_path, safe='/')}"
+        res = requests.get(alt_url, headers=headers, timeout=120)
+        
+    res.raise_for_status()
+    
+    telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    tg_res = requests.post(
+        telegram_url,
+        data={"chat_id": chat_id, "caption": "تم تأكيد دفعك بنجاح! إليك ملف التحميل الخاص بك."},
+        files={"document": ("gaming_vault.zip", res.content, "application/zip")},
+        timeout=120
     )
+    tg_res.raise_for_status()
+    logger.info("تم تسليم الملف بنجاح إلى %s", chat_id)
 
-    response = requests.post(
-        NOWPAYMENTS_URL,
-        headers=headers,
-        json=payload,
-        timeout=30
-    )
+# Webhook لاستقبال تأكيد الدفع من NOWPayments
+@app.post("/webhook/nowpayments")
+async def nowpayments_webhook(request: Request):
+    data = await request.json()
+    logger.info("تم استلام إشعار دفع: %s", data)
+    
+    payment_status = data.get("payment_status")
+    order_id = data.get("order_id", "")
+    
+    # عند اكتمال الدفع بنجاح
+    if payment_status in ["finished", "confirmed"]:
+        parts = order_id.split("-")
+        if len(parts) >= 2 and parts[1].isdigit():
+            user_chat_id = parts[1]
+            try:
+                deliver_product(user_chat_id)
+            except Exception as e:
+                logger.exception("فشل تسليم المنتج تلقائياً: %s", e)
+    return {"status": "ok"}
 
-    logger.info(
-        "NOWPayments HTTP status: %s",
-        response.status_code
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if not data.get("payment_id"):
-        raise RuntimeError(
-            "NOWPayments response does not contain payment_id"
-        )
-
-    if not data.get("pay_address"):
-        raise RuntimeError(
-            "NOWPayments response does not contain pay_address"
-        )
-
-    if not data.get("pay_amount"):
-        raise RuntimeError(
-            "NOWPayments response does not contain pay_amount"
-        )
-
-    return data
-
-
+# أوامر البوت
 @bot.message_handler(commands=["start"])
 def start_handler(message):
-    logger.info(
-        "Received /start from Telegram user %s",
-        message.from_user.id
-    )
-
-    bot.reply_to(
-        message,
-        "مرحباً بك في المتجر الرقمي.\n\n"
-        "الأوامر المتاحة:\n"
-        "/products - عرض المنتجات\n"
-        "/buy - إنشاء طلب دفع"
-    )
-
+    bot.reply_to(message, "مرحباً بك في المتجر الرقمي.\n\nالأوامر المتاحة:\n/products - عرض المنتجات\n/buy - إنشاء طلب دفع")
 
 @bot.message_handler(commands=["products"])
 def products_handler(message):
-    logger.info(
-        "Received /products from Telegram user %s",
-        message.from_user.id
-    )
-
-    bot.reply_to(
-        message,
-        "المنتجات المتاحة:\n\n"
-        "1. Gaming Digital Vault\n"
-        "2. Mobile Repair Pro\n"
-        "3. Smart Profit Manager\n"
-        "4. AI Sales Master Pack\n"
-        "5. Startup Business Plan Kit\n\n"
-        "استخدم /buy لإنشاء طلب دفع."
-    )
-
+    bot.reply_to(message, "المنتجات المتاحة:\n\n1. Gaming Digital Vault\n\nاستخدم /buy لإنشاء طلب دفع.")
 
 @bot.message_handler(commands=["buy"])
 def buy_handler(message):
-    telegram_user_id = message.from_user.id
-    telegram_message_id = message.message_id
-
-    order_id = (
-        f"TG-{telegram_user_id}-{telegram_message_id}"
-    )
-
-    product_name = "Smart Profit Manager"
-    price_usd = 15.00
-
-    logger.info(
-        "Creating order %s for Telegram user %s",
-        order_id,
-        telegram_user_id
-    )
-
+    chat_id = message.from_user.id
+    order_id = f"TG-{chat_id}-{message.message_id}"
+    
+    headers = {"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "price_amount": 15.00,
+        "price_currency": "usd",
+        "pay_currency": "usdttrc20",
+        "ipn_callback_url": CALLBACK_URL,
+        "order_id": order_id,
+        "order_description": "Gaming Digital Vault"
+    }
     try:
-        payment = create_nowpayments_payment(
-            price_usd=price_usd,
-            order_id=order_id,
-            product_name=product_name
-        )
-
-        payment_id = payment.get("payment_id")
-        pay_address = payment.get("pay_address")
-        pay_amount = payment.get("pay_amount")
-        pay_currency = payment.get("pay_currency")
-
+        res = requests.post(NOWPAYMENTS_URL, headers=headers, json=payload, timeout=30)
+        res.raise_for_status()
+        payment = res.json()
+        
         bot.reply_to(
             message,
-            "تم إنشاء طلب الدفع بنجاح.\n\n"
+            f"تم إنشاء طلب الدفع بنجاح.\n\n"
             f"رقم الطلب: {order_id}\n"
-            f"Payment ID: {payment_id}\n"
-            f"المبلغ المطلوب: {pay_amount} {pay_currency}\n\n"
-            f"عنوان الدفع:\n{pay_address}\n\n"
-            "أرسل المبلغ المطلوب إلى العنوان أعلاه.\n"
-            "سيتم تحديث حالة الدفع بواسطة NOWPayments."
+            f"المبلغ المطلوب: {payment.get('pay_amount')} {payment.get('pay_currency')}\n\n"
+            f"عنوان المحفظة للدفع:\n`{payment.get('pay_address')}`\n\n"
+            f"بمجرد وصول التحويل، سيصلك الملف هنا تلقائياً.",
+            parse_mode="Markdown"
         )
+    except Exception as e:
+        logger.exception("خطأ في إنشاء طلب الدفع: %s", e)
+        bot.reply_to(message, "حدث خطأ أثناء الاتصال ببوابة الدفع.")
 
-        logger.info(
-            "Payment created successfully: %s",
-            payment_id
-        )
-
-    except requests.exceptions.HTTPError as error:
-        logger.exception(
-            "NOWPayments HTTP error: %s",
-            error
-        )
-
-        try:
-            error_body = error.response.text
-        except Exception:
-            error_body = "No response body available."
-
-        logger.error(
-            "NOWPayments response: %s",
-            error_body
-        )
-
-        bot.reply_to(
-            message,
-            "تعذر إنشاء طلب الدفع حالياً.\n"
-            "راجع سجلات Railway لمعرفة الخطأ."
-        )
-
-    except requests.exceptions.RequestException as error:
-        logger.exception(
-            "NOWPayments network error: %s",
-            error
-        )
-
-        bot.reply_to(
-            message,
-            "حدث خطأ في الاتصال بخدمة الدفع.\n"
-            "حاول مرة أخرى."
-        )
-
-    except Exception as error:
-        logger.exception(
-            "Unexpected /buy error: %s",
-            error
-        )
-
-        bot.reply_to(
-            message,
-            "حدث خطأ أثناء إنشاء طلب الدفع."
-        )
-
-
-@bot.message_handler(
-    func=lambda message: True,
-    content_types=["text"]
-)
-def text_handler(message):
-    bot.reply_to(
-        message,
-        "استخدم:\n"
-        "/start\n"
-        "/products\n"
-        "/buy"
-    )
-
-
-def start_bot():
-    logger.info("Starting Telegram bot...")
-
-    try:
-        logger.info("Removing existing Telegram webhook...")
-
-        bot.remove_webhook()
-
-        logger.info(
-            "Telegram webhook removed successfully."
-        )
-
-        time.sleep(2)
-
-    except Exception as error:
-        logger.exception(
-            "Webhook removal failed: %s",
-            error
-        )
-
-    while True:
-        try:
-            logger.info(
-                "Starting Telegram long polling..."
-            )
-
-            bot.infinity_polling(
-                timeout=30,
-                long_polling_timeout=30,
-                skip_pending=True
-            )
-
-            logger.warning(
-                "Polling stopped unexpectedly. Restarting..."
-            )
-
-        except KeyboardInterrupt:
-            logger.info(
-                "Bot stopped manually."
-            )
-            break
-
-        except Exception as error:
-            logger.exception(
-                "Telegram polling crashed: %s",
-                error
-            )
-
-            logger.info(
-                "Restarting polling in 5 seconds..."
-            )
-
-            time.sleep(5)
-
+def run_telebot():
+    bot.remove_webhook()
+    time.sleep(2)
+    bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
 
 if __name__ == "__main__":
-    start_bot()
+    bot_thread = threading.Thread(target=run_telebot, daemon=True)
+    bot_thread.start()
+    
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
