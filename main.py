@@ -1,274 +1,96 @@
 import os
 import logging
+from fastapi import FastAPI, Request
+import uvicorn
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 from supabase import create_client, Client
 
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
+# إعداد السجلات
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# ENVIRONMENT VARIABLES
-# ============================================================
-
+# المتغيرات
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
+SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
-if not SUPABASE_URL:
-    raise RuntimeError("SUPABASE_URL is missing")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-if not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_KEY is missing")
+# تطبيق FastAPI
+app = FastAPI()
 
-
-# ============================================================
-# SUPABASE
-# ============================================================
-
-supabase: Client = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY
-)
-
-
-# ============================================================
-# /start
-# ============================================================
+# تطبيق تليجرام
+telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     await update.message.reply_text(
-        "مرحباً بك 👋\n\n"
-        "أهلاً بك في المتجر.\n\n"
-        "استخدم:\n"
-        "/products - عرض المنتجات\n"
-        "/buy رقم_المنتج - عرض تفاصيل المنتج"
+        "مرحباً بك 👋\n\nأهلاً بك في المتجر.\n\nاستخدم:\n/products - عرض المنتجات\n/buy رقم_المنتج - شراء منتج"
     )
-
-
-# ============================================================
-# /products
-# ============================================================
 
 async def products(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     try:
-
-        result = (
-            supabase
-            .table("deals")
-            .select("*")
-            .execute()
-        )
-
-        deals = result.data or []
-
+        res = supabase.table("deals").select("*").execute()
+        deals = res.data or []
         if not deals:
-            await update.message.reply_text(
-                "لا توجد منتجات متاحة حالياً."
-            )
+            await update.message.reply_text("لا توجد منتجات متاحة حالياً.")
             return
-
-        message = "🛍 المنتجات المتاحة:\n\n"
-
-        for index, deal in enumerate(deals, start=1):
-
-            deal_id = (
-                deal.get("id")
-                or deal.get("deal_id")
-                or index
-            )
-
-            name = (
-                deal.get("name")
-                or deal.get("title")
-                or deal.get("product_name")
-                or f"Product {index}"
-            )
-
-            price = (
-                deal.get("price_usd")
-                or deal.get("price")
-                or "غير محدد"
-            )
-
-            currency = (
-                deal.get("pay_currency")
-                or "USDT"
-            )
-
-            message += (
-                f"🆔 {deal_id}\n"
-                f"📦 {name}\n"
-                f"💰 {price} {currency}\n"
-                f"➡️ /buy {deal_id}\n\n"
-            )
-
-        await update.message.reply_text(message)
-
+        
+        msg = "🛍 المنتجات المتاحة:\n\n"
+        for idx, deal in enumerate(deals, start=1):
+            d_id = deal.get("id") or idx
+            name = deal.get("product_name") or deal.get("name") or f"منتج {idx}"
+            price = deal.get("price") or deal.get("price_usd") or "0"
+            curr = deal.get("pay_currency") or "USDT"
+            msg += f"🆔 {d_id} | 📦 {name}\n💰 {price} {curr}\n➡️ /buy {d_id}\n\n"
+        await update.message.reply_text(msg)
     except Exception as e:
-
-        logger.exception("PRODUCTS ERROR")
-
-        await update.message.reply_text(
-            "حدث خطأ أثناء قراءة المنتجات."
-        )
-
-
-# ============================================================
-# /buy
-# ============================================================
+        logger.exception("Error in /products")
+        await update.message.reply_text("حدث خطأ أثناء تحميل المنتجات.")
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     if not context.args:
-
-        await update.message.reply_text(
-            "استخدم الأمر بهذا الشكل:\n\n"
-            "/buy رقم_المنتج"
-        )
-
+        await update.message.reply_text("يرجى كتابة رقم المنتج، مثال:\n/buy 1")
         return
-
-    deal_id = context.args[0]
-
+    d_id = context.args[0]
     try:
-
-        result = (
-            supabase
-            .table("deals")
-            .select("*")
-            .eq("id", deal_id)
-            .limit(1)
-            .execute()
-        )
-
-        deals = result.data or []
-
+        res = supabase.table("deals").select("*").eq("id", d_id).execute()
+        deals = res.data or []
         if not deals:
-
-            await update.message.reply_text(
-                "❌ المنتج غير موجود."
-            )
-
+            await update.message.reply_text("❌ المنتج غير موجود.")
             return
-
         deal = deals[0]
-
-        name = (
-            deal.get("name")
-            or deal.get("title")
-            or deal.get("product_name")
-            or "منتج"
-        )
-
-        description = (
-            deal.get("description")
-            or "لا يوجد وصف."
-        )
-
-        price = (
-            deal.get("price_usd")
-            or deal.get("price")
-            or "غير محدد"
-        )
-
-        currency = (
-            deal.get("pay_currency")
-            or "USDT"
-        )
-
-        message = (
-            f"📦 {name}\n\n"
-            f"{description}\n\n"
-            f"💰 السعر: {price} {currency}\n\n"
-            f"🆔 ID: {deal_id}\n\n"
-            "تم العثور على المنتج بنجاح."
-        )
-
-        await update.message.reply_text(message)
-
+        name = deal.get("product_name") or deal.get("name") or "منتج"
+        price = deal.get("price") or deal.get("price_usd") or "0"
+        curr = deal.get("pay_currency") or "USDT"
+        url = deal.get("deal_url") or "لا يوجد رابط"
+        await update.message.reply_text(f"📦 المنتج: {name}\n💰 السعر: {price} {curr}\n🔗 الرابط: {url}")
     except Exception:
+        await update.message.reply_text("حدث خطأ أثناء جلب تفاصيل المنتج.")
 
-        logger.exception("BUY ERROR")
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("products", products))
+telegram_app.add_handler(CommandHandler("buy", buy))
 
-        await update.message.reply_text(
-            "حدث خطأ أثناء قراءة المنتج."
-        )
+@app.on_event("startup")
+async def startup():
+    await telegram_app.initialize()
 
+@app.get("/")
+def home():
+    return {"status": "ok"}
 
-# ============================================================
-# ERROR HANDLER
-# ============================================================
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    logger.exception(
-        "Telegram error: %s",
-        context.error
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    logger.info("Starting Telegram bot...")
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    application.add_handler(
-        CommandHandler("products", products)
-    )
-
-    application.add_handler(
-        CommandHandler("buy", buy)
-    )
-
-    application.add_error_handler(
-        error_handler
-    )
-
-    logger.info("Deleting old Telegram webhook...")
-
-    # مهم جداً:
-    # إزالة أي Webhook قديم حتى لا يمنع Polling
-    application.run_polling(
-        drop_pending_updates=False
-    )
-
+# هذا المسار يحل مشكلة 405 نهائياً لأنه يقبل POST من تليجرام
+@app.post("/")
+async def telegram_webhook(request: Request):
+    req_json = await request.json()
+    update = Update.de_json(req_json, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"status": "ok"}
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
