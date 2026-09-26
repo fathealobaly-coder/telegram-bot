@@ -1,4 +1,6 @@
 fastapi
-uvicorn
-httpx
-python-telegram-bot
+uvicorn[standard]
+python-telegram-bot[webhooks]
+supabase
+requests
+python-dotenv
