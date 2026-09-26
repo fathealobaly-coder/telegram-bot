@@ -1,96 +1,116 @@
 import os
 import logging
-from fastapi import FastAPI, Request
-import uvicorn
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from supabase import create_client, Client
 
-# إعداد السجلات
-logging.basicConfig(level=logging.INFO)
+# إعداد السجلات (Logs)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# المتغيرات
+# جلب المتغيرات
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
+    raise ValueError("BOT_TOKEN is missing!")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("Supabase credentials are missing!")
 
+# الاتصال بقاعدة بيانات Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# تطبيق FastAPI
-app = FastAPI()
-
-# تطبيق تليجرام
-telegram_app = Application.builder().token(BOT_TOKEN).build()
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "مرحباً بك 👋\n\nأهلاً بك في المتجر.\n\nاستخدم:\n/products - عرض المنتجات\n/buy رقم_المنتج - شراء منتج"
+# أمر البداية /start
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_text = (
+        "مرحباً بك 👋\n\n"
+        "أهلاً بك في المتجر الإلكتروني.\n\n"
+        "📌 الأوامر المتاحة:\n"
+        "🔹 /products - لعرض المنتجات المتاحة\n"
+        "🔹 /buy <رقم_المنتج> - لعرض تفاصيل شراء المنتج"
     )
+    await update.message.reply_text(welcome_text)
 
-async def products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# أمر عرض المنتجات /products
+async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        res = supabase.table("deals").select("*").execute()
-        deals = res.data or []
+        response = supabase.table("deals").select("*").execute()
+        deals = response.data or []
+
         if not deals:
-            await update.message.reply_text("لا توجد منتجات متاحة حالياً.")
+            await update.message.reply_text("عذراً، لا توجد منتجات متاحة حالياً.")
             return
-        
-        msg = "🛍 المنتجات المتاحة:\n\n"
-        for idx, deal in enumerate(deals, start=1):
-            d_id = deal.get("id") or idx
-            name = deal.get("product_name") or deal.get("name") or f"منتج {idx}"
-            price = deal.get("price") or deal.get("price_usd") or "0"
-            curr = deal.get("pay_currency") or "USDT"
-            msg += f"🆔 {d_id} | 📦 {name}\n💰 {price} {curr}\n➡️ /buy {d_id}\n\n"
-        await update.message.reply_text(msg)
+
+        message = "🛍️ **قائمة المنتجات المتاحة:**\n\n"
+        for item in deals:
+            item_id = item.get("id", "")
+            title = item.get("product_name") or item.get("name") or "منتج رقم " + str(item_id)
+            price = item.get("price") or item.get("price_usd") or "0"
+            currency = item.get("pay_currency") or "USDT"
+
+            message += f"🆔 الرقم: `{item_id}`\n"
+            message += f"📦 الاسم: {title}\n"
+            message += f"💰 السعر: {price} {currency}\n"
+            message += f"👉 للشراء: /buy {item_id}\n"
+            message += "──────────────\n"
+
+        await update.message.reply_text(message, parse_mode="Markdown")
+
     except Exception as e:
-        logger.exception("Error in /products")
-        await update.message.reply_text("حدث خطأ أثناء تحميل المنتجات.")
+        logger.error(f"خطأ أثناء جلب المنتجات: {e}")
+        await update.message.reply_text("حدث خطأ أثناء تحميل المنتجات، يرجى المحاولة لاحقاً.")
 
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# أمر الشراء والتفاصيل /buy
+async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("يرجى كتابة رقم المنتج، مثال:\n/buy 1")
+        await update.message.reply_text("يرجى تحديد رقم المنتج بعد الأمر، مثال:\n`/buy 1`", parse_mode="Markdown")
         return
-    d_id = context.args[0]
+
+    product_id = context.args[0]
+
     try:
-        res = supabase.table("deals").select("*").eq("id", d_id).execute()
-        deals = res.data or []
+        response = supabase.table("deals").select("*").eq("id", product_id).execute()
+        deals = response.data or []
+
         if not deals:
-            await update.message.reply_text("❌ المنتج غير موجود.")
+            await update.message.reply_text(f"❌ لم يتم العثور على منتج يحمل الرقم {product_id}.")
             return
+
         deal = deals[0]
-        name = deal.get("product_name") or deal.get("name") or "منتج"
+        title = deal.get("product_name") or deal.get("name") or f"منتج {product_id}"
         price = deal.get("price") or deal.get("price_usd") or "0"
-        curr = deal.get("pay_currency") or "USDT"
-        url = deal.get("deal_url") or "لا يوجد رابط"
-        await update.message.reply_text(f"📦 المنتج: {name}\n💰 السعر: {price} {curr}\n🔗 الرابط: {url}")
-    except Exception:
+        currency = deal.get("pay_currency") or "USDT"
+        link = deal.get("deal_url") or deal.get("url") or "لا يوجد رابط مباشر"
+
+        reply = (
+            f"🛒 **تفاصيل المنتج:**\n\n"
+            f"📦 **الاسم:** {title}\n"
+            f"💰 **السعر:** {price} {currency}\n"
+            f"🔗 **رابط الشراء/التفاصيل:** {link}\n"
+        )
+        await update.message.reply_text(reply, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"خطأ في أمر الشراء: {e}")
         await update.message.reply_text("حدث خطأ أثناء جلب تفاصيل المنتج.")
 
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(CommandHandler("products", products))
-telegram_app.add_handler(CommandHandler("buy", buy))
+def main():
+    logger.info("Starting Telegram Bot with Polling...")
+    
+    # بناء تطبيق البوت
+    app = Application.builder().token(BOT_TOKEN).build()
 
-@app.on_event("startup")
-async def startup():
-    await telegram_app.initialize()
+    # تسجيل الأوامر
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("products", products_command))
+    app.add_handler(CommandHandler("buy", buy_command))
 
-@app.get("/")
-def home():
-    return {"status": "ok"}
-
-# هذا المسار يحل مشكلة 405 نهائياً لأنه يقبل POST من تليجرام
-@app.post("/")
-async def telegram_webhook(request: Request):
-    req_json = await request.json()
-    update = Update.de_json(req_json, telegram_app.bot)
-    await telegram_app.process_update(update)
-    return {"status": "ok"}
+    # تشغيل مستمر بدون توقف (Polling)
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    main()
